@@ -60,5 +60,6 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="Table\t_cal_eprocure.sql" />
+    <None Include="Table\t_cal_eprocure_attachments.sql" />
   </ItemGroup>
 </Project>

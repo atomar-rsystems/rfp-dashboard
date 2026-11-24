@@ -1,6 +1,6 @@
 <Solution>
   <Project Path="RfpDashboardDatabase/RfpDashboardDatabase.sqlproj">
-    <Build />
+    <Build Solution="Release|*" />
     <Deploy />
   </Project>
   <Project Path="RfpDashboard.csproj" />

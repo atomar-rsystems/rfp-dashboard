@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Net;
 using System.Text;
 using System.Text.RegularExpressions;
+using Hangfire;
 using Hangfire.Console;
 using Hangfire.Server;
 using Microsoft.Playwright;
@@ -50,9 +51,9 @@ public sealed class CalProcureSyncJob
             await using var command = _connection.CreateCommand();
             command.CommandText = """
                 INSERT INTO public.t_cal_eprocure
-                (department_code, department_name, event_id, event_name, format, event_type, end_date, status, buyer_name, buyer_email)
+                (department_code, department_name, event_id, event_name, format, event_type, end_date, status, buyer_name, buyer_email, triage_status)
                 VALUES
-                (@departmentCode, @departmentName, @eventId, @eventName, @format, @eventType, @endDate, @status, @buyerName, @buyerEmail)
+                (@departmentCode, @departmentName, @eventId, @eventName, @format, @eventType, @endDate, @status, @buyerName, @buyerEmail, 'PENDING')
                 ON CONFLICT (department_code, event_id) DO NOTHING;
                 """;
 
@@ -71,11 +72,17 @@ public sealed class CalProcureSyncJob
         }
 
         LogProgress(context, "California eProcure sync completed. Parsed: {0}, inserted: {1}", records.Count, inserted);
+
+        if (inserted > 0)
+        {
+            BackgroundJob.Enqueue<CalProcureClassifyJob>(job => job.ExecuteAsync(null, CancellationToken.None));
+            LogProgress(context, "Enqueued CalProcureClassifyJob to evaluate {0} new events.", inserted);
+        }
     }
 
     private void LogProgress(PerformContext? context, string format, params object?[] args)
     {
-        var formatted = args.Length > 0 ? string.Format(CultureInfo.InvariantCulture, format, args) : format;
+        var formatted = args.Length > 0 ? string.Format(format, args) : format;
         _logger.LogInformation("{Message}", formatted);
 
         if (context is not null)
@@ -126,7 +133,7 @@ public sealed class CalProcureSyncJob
         return localFile;
     }
 
-    private async Task<IDownload> ClickExportAndDownloadAsync(IBrowserContext browserContext, IPage page, PerformContext? context)
+    private async Task<IDownload> ClickExportAndDownloadAsync(IBrowserContext context, IPage page, PerformContext? contextLog)
     {
         var exportButton = await FindVisibleExportButtonAsync(page, 60000);
         if (exportButton is null)
@@ -136,10 +143,10 @@ public sealed class CalProcureSyncJob
             throw new TimeoutException($"Download button was not found on the California eProcure page. Screenshot saved to: {debugPath}");
         }
 
-        LogProgress(context, "Clicking export button...");
+        LogProgress(contextLog, "Clicking export button...");
 
-        var directDownloadTask = page.WaitForDownloadAsync(new PageWaitForDownloadOptions { Timeout = 10000 });
-        var popupTask = browserContext.WaitForPageAsync(new BrowserContextWaitForPageOptions { Timeout = 10000 });
+        var directDownloadTask = page.WaitForDownloadAsync(new PageWaitForDownloadOptions { Timeout = 15000 });
+        var popupTask = context.WaitForPageAsync(new BrowserContextWaitForPageOptions { Timeout = 15000 });
 
         await exportButton.ClickAsync();
 
@@ -149,19 +156,24 @@ public sealed class CalProcureSyncJob
         }
         catch (TimeoutException)
         {
+            // Expected when the portal opens #attachmentWrapperModal first
         }
 
-        var modal = page.Locator("#attachmentWrapperModal.in, #attachmentWrapperModal.show, #attachmentWrapperModal:visible").First;
-        if (await modal.CountAsync() > 0)
+        var modal = page.Locator("#attachmentWrapperModal");
+        if (await modal.CountAsync() > 0 && await modal.IsVisibleAsync())
         {
-            LogProgress(context, "Detected #attachmentWrapperModal dialog; waiting for Download Attachment control...");
+            LogProgress(contextLog, "Detected #attachmentWrapperModal dialog; waiting for Download Attachment control...");
 
-            var modalDownloadBtn = modal.Locator("a:has-text('Download Attachment'), button:has-text('Download Attachment'), [id*='DownloadAttachment'], a, button").Filter(new LocatorFilterOptions
+            var modalDownloadBtn = modal.Locator(
+                "a:has-text('Download Attachment'), button:has-text('Download Attachment'), " +
+                "a:has-text('Download'), button:has-text('Download'), a[href*='psfile'], a[id*='ATTACH']"
+            ).First;
+
+            await modalDownloadBtn.WaitForAsync(new LocatorWaitForOptions
             {
-                HasTextRegex = new Regex("Download", RegexOptions.IgnoreCase)
-            }).First;
-
-            await modalDownloadBtn.WaitForAsync(new LocatorWaitForOptions { State = WaitForSelectorState.Visible, Timeout = 60000 });
+                State = WaitForSelectorState.Visible,
+                Timeout = 30000
+            });
 
             return await page.RunAndWaitForDownloadAsync(async () =>
             {
@@ -169,19 +181,17 @@ public sealed class CalProcureSyncJob
             }, new PageRunAndWaitForDownloadOptions { Timeout = 120000 });
         }
 
-        IPage targetPage;
+        IPage targetPage = page;
         try
         {
             targetPage = await popupTask;
         }
         catch (TimeoutException)
         {
-            targetPage = page;
+            // No popup opened; check current page
         }
 
         var attachmentLink = targetPage.GetByText("Download Attachment", new PageGetByTextOptions { Exact = false }).First;
-        await attachmentLink.WaitForAsync(new LocatorWaitForOptions { State = WaitForSelectorState.Visible, Timeout = 60000 });
-
         return await targetPage.RunAndWaitForDownloadAsync(async () =>
         {
             await attachmentLink.ClickAsync();
@@ -271,9 +281,7 @@ public sealed class CalProcureSyncJob
     private static List<CalProcureRecord> ParseDownloadedFile(string filePath)
     {
         var text = File.ReadAllText(filePath);
-        if (filePath.EndsWith(".html", StringComparison.OrdinalIgnoreCase)
-            || filePath.EndsWith(".xls", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("<table", StringComparison.OrdinalIgnoreCase))
+        if (filePath.EndsWith(".html", StringComparison.OrdinalIgnoreCase) || text.Contains("<table", StringComparison.OrdinalIgnoreCase))
         {
             return ParseHtmlTable(text);
         }
@@ -284,19 +292,12 @@ public sealed class CalProcureSyncJob
     private static List<CalProcureRecord> ParseHtmlTable(string html)
     {
         var rows = new List<string[]>();
-        // PeopleSoft HTML .xls exports omit closing </tr> tags between data rows
-        var rowChunks = Regex.Split(html, "<tr[^>]*>", RegexOptions.IgnoreCase);
 
-        foreach (var chunk in rowChunks)
+        var trChunks = Regex.Split(html, "<tr[^>]*>", RegexOptions.IgnoreCase);
+        foreach (var chunk in trChunks.Skip(1))
         {
-            if (!chunk.Contains("<td", StringComparison.OrdinalIgnoreCase)
-                && !chunk.Contains("<th", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            var endIndex = chunk.IndexOf("</tr>", StringComparison.OrdinalIgnoreCase);
-            var rowContent = endIndex >= 0 ? chunk[..endIndex] : chunk;
+            var endIdx = chunk.IndexOf("</tr>", StringComparison.OrdinalIgnoreCase);
+            var rowContent = endIdx >= 0 ? chunk[..endIdx] : chunk;
 
             var row = new List<string>();
             foreach (Match cell in Regex.Matches(rowContent, "<t[hd][^>]*>(?<value>.*?)</t[hd]>", RegexOptions.IgnoreCase | RegexOptions.Singleline))
@@ -358,7 +359,7 @@ public sealed class CalProcureSyncJob
             var departmentName = GetValue(row, headers, "departmentname", "businessunitdescription") ?? "Unknown";
             var eventName = GetValue(row, headers, "eventname", "title", "description") ?? "Unknown";
             var format = GetValue(row, headers, "format", "submissionformat") ?? "Unknown";
-            var eventType = GetValue(row, headers, "type", "eventtype") ?? "Unknown";
+            var eventType = GetValue(row, headers, "eventtype", "type") ?? "Unknown";
             var status = GetValue(row, headers, "status", "eventstatus") ?? "Unknown";
             var buyerName = GetValue(row, headers, "buyername", "contactname", "buyer");
             var buyerEmail = GetValue(row, headers, "buyeremail", "contactemail", "email");
@@ -482,12 +483,13 @@ public sealed class CalProcureSyncJob
             return DateTimeOffset.UtcNow;
         }
 
-        // Strip trailing timezone abbreviations like "PST" or "PDT" that DateTimeOffset.TryParse cannot parse
-        var cleaned = Regex.Replace(value.Trim(), @"\s+(PST|PDT|UTC|GMT)$", "", RegexOptions.IgnoreCase);
+        var cleaned = Regex.Replace(value.Trim(), @"\s+(PST|PDT|UTC|GMT)$", string.Empty, RegexOptions.IgnoreCase);
 
-        if (DateTimeOffset.TryParse(cleaned, CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsed))
+        if (DateTime.TryParse(cleaned, CultureInfo.InvariantCulture, DateTimeStyles.None, out var localDt))
         {
-            return parsed;
+            var pacificZone = TimeZoneInfo.FindSystemTimeZoneById("America/Los_Angeles");
+            var offset = pacificZone.GetUtcOffset(localDt);
+            return new DateTimeOffset(localDt, offset).ToUniversalTime();
         }
 
         return DateTimeOffset.UtcNow;

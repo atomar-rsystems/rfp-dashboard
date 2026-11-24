@@ -14,3 +14,15 @@
     -- Optional: Enforce uniqueness on Department + Event ID
     CONSTRAINT uq_department_event UNIQUE (department_code, event_id)
 );
+
+ALTER TABLE public.t_cal_eprocure
+    ADD COLUMN IF NOT EXISTS triage_status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
+    ADD COLUMN IF NOT EXISTS is_it BOOLEAN,
+    ADD COLUMN IF NOT EXISTS llm_confidence NUMERIC(4,3),
+    ADD COLUMN IF NOT EXISTS llm_reason TEXT,
+    ADD COLUMN IF NOT EXISTS full_description TEXT,
+    ADD COLUMN IF NOT EXISTS unspsc_codes TEXT,
+    ADD COLUMN IF NOT EXISTS visited_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_t_cal_eprocure_triage_status
+    ON public.t_cal_eprocure (triage_status);
