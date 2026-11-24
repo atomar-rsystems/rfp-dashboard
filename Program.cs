@@ -11,6 +11,8 @@ var connectionString = builder.Configuration.GetConnectionString("DefaultConnect
 
 builder.Services.AddScoped(_ => new NpgsqlConnection(connectionString));
 builder.Services.AddScoped<CalProcureSyncJob>();
+builder.Services.AddScoped<CalProcureClassifyJob>();
+builder.Services.AddHttpClient();
 
 builder.Services.AddHangfire(configuration =>
     configuration

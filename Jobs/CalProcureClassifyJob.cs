@@ -1,15 +1,15 @@
-﻿using DocumentFormat.OpenXml.Packaging;
-using Hangfire.Console;
-using Hangfire.Server;
-using Microsoft.Playwright;
-using Npgsql;
-using System.Data;
+﻿using System.Data;
+using System.Net;
 using System.Net.Http.Headers;
-using System.Net.Mail;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using DocumentFormat.OpenXml.Packaging;
+using Hangfire.Console;
+using Hangfire.Server;
+using Microsoft.Playwright;
+using Npgsql;
 using UglyToad.PdfPig;
 
 namespace RfpDashboard.Jobs;
@@ -68,11 +68,8 @@ public sealed class CalProcureClassifyJob
 
     public async Task ExecuteAsync(PerformContext? context, CancellationToken cancellationToken = default)
     {
-        LogProgress(context, "Starting Cal eProcure classification job run.");
-
         if (_connection.State != ConnectionState.Open)
         {
-            LogProgress(context, "Opening database connection...");
             await _connection.OpenAsync(cancellationToken);
         }
 
@@ -81,7 +78,6 @@ public sealed class CalProcureClassifyJob
 
         if (pendingEvents.Count == 0)
         {
-            LogProgress(context, "No pending events found. Job run completed.");
             return;
         }
 
@@ -102,17 +98,15 @@ public sealed class CalProcureClassifyJob
 
         browserContext.SetDefaultTimeout(60000);
         var page = await browserContext.NewPageAsync();
-        LogProgress(context, "Browser initialized. Starting event processing loop.");
 
-        var processedCount = 0;
-        foreach (var ev in pendingEvents)
+        for (int idx = 0; idx < pendingEvents.Count; idx++)
         {
+            var ev = pendingEvents[idx];
             cancellationToken.ThrowIfCancellationRequested();
-            LogProgress(context, "Processing event {0}-{1} ({2}/{3})", ev.DepartmentCode, ev.EventId, processedCount + 1, pendingEvents.Count);
 
             try
             {
-                await ProcessSingleEventAsync(page, ev, context, cancellationToken);
+                await ProcessSingleEventAsync(browserContext, page, ev, context, cancellationToken);
             }
             catch (Exception ex)
             {
@@ -121,17 +115,13 @@ public sealed class CalProcureClassifyJob
                 await MarkEventErrorAsync(ev, ex.Message, cancellationToken);
             }
 
-            processedCount++;
-            LogProgress(context, "Finished event {0}-{1} ({2}/{3})", ev.DepartmentCode, ev.EventId, processedCount, pendingEvents.Count);
-
-            // Polite delay to avoid rate limiting
+            LogProgress(context, "Finished event {0}-{1} ({2}/{3})", ev.DepartmentCode, ev.EventId, idx + 1, pendingEvents.Count);
             await page.WaitForTimeoutAsync(2000);
         }
-
-        LogProgress(context, "Cal eProcure classification job run completed. Processed {0} events.", processedCount);
     }
 
     private async Task ProcessSingleEventAsync(
+        IBrowserContext browserContext,
         IPage page,
         PendingEvent ev,
         PerformContext? context,
@@ -144,9 +134,6 @@ public sealed class CalProcureClassifyJob
         await page.WaitForTimeoutAsync(3000);
 
         var (description, unspscCodes) = await ScrapeLandingPageDetailsAsync(page);
-        LogProgress(context, "Scraped landing page for {0}-{1}. UNSPSC count: {2}, description length: {3}", ev.DepartmentCode, ev.EventId, unspscCodes.Count, description.Length);
-
-        // Step 1: Fast in-memory triage
         var triage = EvaluateInMemoryTriage(ev, description, unspscCodes);
         LogProgress(context, "Triage decision for {0}-{1}: {2}", ev.DepartmentCode, ev.EventId, triage);
 
@@ -166,14 +153,12 @@ public sealed class CalProcureClassifyJob
             return;
         }
 
-        // Step 2: Could be IT -> Open "View Event Package", download scope files, and confirm with LLM
         LogProgress(context, "Potential IT candidate ({0}-{1}). Opening Event Package...", ev.DepartmentCode, ev.EventId);
 
-        var attachmentTexts = await DownloadAndExtractAttachmentsAsync(page, ev, context, cancellationToken);
+        var attachmentTexts = await DownloadAndExtractAttachmentsAsync(browserContext, page, ev, context, cancellationToken);
         LogProgress(context, "Downloaded and extracted {0} attachment text blocks for {1}-{2}", attachmentTexts.Count, ev.DepartmentCode, ev.EventId);
 
-        var llmResult = await ConfirmWithLlmAsync(ev, description, unspscCodes, attachmentTexts, cancellationToken);
-
+        var llmResult = await ConfirmWithLlmAsync(ev, description, unspscCodes, attachmentTexts, context, cancellationToken);
         var finalStatus = llmResult.IsIt ? "IT_CONFIRMED" : "NON_IT_CONFIRMED";
 
         await UpdateEventClassificationAsync(
@@ -201,8 +186,13 @@ public sealed class CalProcureClassifyJob
         var allText = new StringBuilder();
         var unspscSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var frame in page.Frames)
+        foreach (var frame in page.Frames.ToList())
         {
+            if (frame.IsDetached)
+            {
+                continue;
+            }
+
             try
             {
                 var bodyText = await frame.InnerTextAsync("body");
@@ -278,6 +268,7 @@ public sealed class CalProcureClassifyJob
     }
 
     private async Task<List<(string FileName, string ExtractedText)>> DownloadAndExtractAttachmentsAsync(
+        IBrowserContext browserContext,
         IPage page,
         PendingEvent ev,
         PerformContext? context,
@@ -285,85 +276,356 @@ public sealed class CalProcureClassifyJob
     {
         var results = new List<(string FileName, string ExtractedText)>();
 
-        ILocator? packageBtn = null;
-        foreach (var frame in page.Frames)
-        {
-            var candidate = frame.Locator("button:has-text('View Event Package'), a:has-text('View Event Package'), input[value*='View Event Package']").First;
-            if (await candidate.CountAsync() > 0 && await candidate.IsVisibleAsync())
-            {
-                packageBtn = candidate;
-                break;
-            }
-        }
-
+        var packageBtn = await FindViewEventPackageButtonAsync(page, 15000);
         if (packageBtn is null)
         {
             LogProgress(context, "View Event Package button not found for {0}-{1}.", ev.DepartmentCode, ev.EventId);
             return results;
         }
 
-        LogProgress(context, "Opening Event Package for {0}-{1}.", ev.DepartmentCode, ev.EventId);
         await packageBtn.ClickAsync();
-        await page.WaitForTimeoutAsync(4000);
+        await page.WaitForTimeoutAsync(3000);
 
         var downloadFolder = Path.Combine(Path.GetTempPath(), "caleprocure_pkg", $"{ev.DepartmentCode}_{ev.EventId}");
         Directory.CreateDirectory(downloadFolder);
         LogProgress(context, "Using download folder: {0}", downloadFolder);
 
-        foreach (var frame in page.Frames)
-        {
-            var downloadLinks = frame.Locator("a:has-text('Download'), button:has-text('Download'), a[id*='ATTACH'], button[id*='ATTACH']");
-            var count = await downloadLinks.CountAsync();
+        int buttonCount = await WaitForAttachmentButtonsAsync(page, 12000);
+        LogProgress(context, "Found {0} attachment download buttons for {1}-{2}.", buttonCount, ev.DepartmentCode, ev.EventId);
 
-            for (int i = 0; i < Math.Min(count, 8); i++)
+        int maxToProcess = Math.Min(buttonCount, 8);
+        for (int i = 0; i < maxToProcess; i++)
+        {
+            await EnsureAttachmentModalClosedAsync(page);
+            await CloseExtraPagesAsync(browserContext, page);
+
+            var rowButton = await FindAttachmentRowButtonAsync(page, i);
+            if (rowButton is null)
             {
-                var link = downloadLinks.Nth(i);
-                if (!await link.IsVisibleAsync())
+                LogProgress(context, "Attachment button index {0} was not visible for {1}-{2}.", i, ev.DepartmentCode, ev.EventId);
+                continue;
+            }
+
+            try
+            {
+                var downloadedFile = await DownloadAttachmentViaModalHrefAsync(browserContext, page, rowButton, downloadFolder, context);
+                if (downloadedFile is null)
+                {
+                    LogProgress(context, "Attachment download returned empty for {0}-{1} (index {2}).", ev.DepartmentCode, ev.EventId, i);
+                    continue;
+                }
+
+                var (fileName, savedPath) = downloadedFile.Value;
+
+                if (BoilerplateFileKeywords.Any(b => fileName.Contains(b, StringComparison.OrdinalIgnoreCase)))
+                {
+                    LogProgress(context, "Skipped boilerplate attachment: {0}", fileName);
+                    continue;
+                }
+
+                var text = ExtractTextFromFile(savedPath);
+                if (!string.IsNullOrWhiteSpace(text))
+                {
+                    results.Add((fileName, text));
+                    await SaveAttachmentMetadataAsync(ev, fileName, savedPath, text, cancellationToken);
+                    LogProgress(context, "Extracted {0} chars from {1}", text.Length, fileName);
+                }
+            }
+            catch (Exception ex)
+            {
+                LogProgress(context, "Attachment download error for {0}-{1} (index {2}): {3}", ev.DepartmentCode, ev.EventId, i, ex.Message);
+            }
+            finally
+            {
+                await EnsureAttachmentModalClosedAsync(page);
+                await CloseExtraPagesAsync(browserContext, page);
+            }
+        }
+
+        return results;
+    }
+
+    private async Task<(string FileName, string SavedPath)?> DownloadAttachmentViaModalHrefAsync(
+        IBrowserContext browserContext,
+        IPage page,
+        ILocator rowButton,
+        string downloadFolder,
+        PerformContext? context)
+    {
+        await rowButton.ScrollIntoViewIfNeededAsync();
+        await rowButton.ClickAsync();
+
+        // Wait for #attachmentWrapperModal to render <a id="downloadButton" href="...">
+        var downloadLink = await WaitForModalDownloadAnchorAsync(page, 15000);
+        if (downloadLink is null)
+        {
+            return null;
+        }
+
+        var href = await downloadLink.GetAttributeAsync("href");
+        if (string.IsNullOrWhiteSpace(href))
+        {
+            return null;
+        }
+
+        var absoluteUrl = new Uri(new Uri(page.Url), href).ToString();
+        var rawFileName = Path.GetFileName(new Uri(absoluteUrl).LocalPath);
+        var decodedFileName = WebUtility.UrlDecode(rawFileName);
+        if (string.IsNullOrWhiteSpace(decodedFileName))
+        {
+            decodedFileName = $"attachment-{Guid.NewGuid():N}.bin";
+        }
+
+        // Fetch file bytes directly using the browser context's authenticated cookies (avoids Edge inline PDF viewer lock)
+        var apiResponse = await browserContext.APIRequest.GetAsync(absoluteUrl, new APIRequestContextOptions
+        {
+            Timeout = 45000
+        });
+
+        if (!apiResponse.Ok)
+        {
+            LogProgress(context, "Authenticated download HTTP {0} for {1}", apiResponse.Status, decodedFileName);
+            return null;
+        }
+
+        var bytes = await apiResponse.BodyAsync();
+        var savedPath = Path.Combine(downloadFolder, decodedFileName);
+        await File.WriteAllBytesAsync(savedPath, bytes);
+        LogProgress(context, "Saved attachment ({0} bytes): {1}", bytes.Length, decodedFileName);
+
+        return (decodedFileName, savedPath);
+    }
+
+    private static async Task<ILocator?> WaitForModalDownloadAnchorAsync(IPage page, int timeoutMs)
+    {
+        var selectors = new[]
+        {
+            "#attachmentWrapperModal a#downloadButton[href]",
+            "#attachmentWrapperModal a[href*='viewredirect']",
+            "#attachmentWrapperModal a:has-text('Download Attachment')[href]",
+            ".modal.in a#downloadButton[href]",
+            ".modal.show a#downloadButton[href]"
+        };
+
+        var startedAt = DateTime.UtcNow;
+
+        while ((DateTime.UtcNow - startedAt).TotalMilliseconds < timeoutMs)
+        {
+            foreach (var selector in selectors)
+            {
+                var topAnchor = page.Locator(selector).First;
+                if (await topAnchor.CountAsync() > 0 && await topAnchor.IsVisibleAsync())
+                {
+                    var href = await topAnchor.GetAttributeAsync("href");
+                    if (!string.IsNullOrWhiteSpace(href) && href != "#")
+                    {
+                        return topAnchor;
+                    }
+                }
+            }
+
+            foreach (var frame in page.Frames.ToList())
+            {
+                if (frame.IsDetached)
                 {
                     continue;
                 }
 
-                try
+                foreach (var selector in selectors)
                 {
-                    var download = await page.RunAndWaitForDownloadAsync(async () =>
+                    try
                     {
-                        await link.ClickAsync();
-
-                        var modalBtn = page.Locator("#attachmentWrapperModal a, #attachmentWrapperModal button").First;
-                        if (await modalBtn.CountAsync() > 0 && await modalBtn.IsVisibleAsync())
+                        var frameAnchor = frame.Locator(selector).First;
+                        if (await frameAnchor.CountAsync() > 0 && await frameAnchor.IsVisibleAsync())
                         {
-                            await modalBtn.ClickAsync();
+                            var href = await frameAnchor.GetAttributeAsync("href");
+                            if (!string.IsNullOrWhiteSpace(href) && href != "#")
+                            {
+                                return frameAnchor;
+                            }
                         }
-                    }, new PageRunAndWaitForDownloadOptions { Timeout = 25000 });
-
-                    var suggestedName = download.SuggestedFilename;
-
-                    if (BoilerplateFileKeywords.Any(b => suggestedName.Contains(b, StringComparison.OrdinalIgnoreCase)))
-                    {
-                        LogProgress(context, "Skipping boilerplate attachment for {0}-{1}: {2}", ev.DepartmentCode, ev.EventId, suggestedName);
-                        continue;
                     }
-
-                    var savedPath = Path.Combine(downloadFolder, suggestedName);
-                    await download.SaveAsAsync(savedPath);
-
-                    var text = ExtractTextFromFile(savedPath);
-                    if (!string.IsNullOrWhiteSpace(text))
+                    catch
                     {
-                        results.Add((suggestedName, text));
-                        await SaveAttachmentMetadataAsync(ev, suggestedName, savedPath, text, cancellationToken);
-                        LogProgress(context, "Captured attachment text for {0}-{1}: {2}", ev.DepartmentCode, ev.EventId, suggestedName);
+                        // Ignore transient frame detachments
                     }
                 }
-                catch (TimeoutException)
+            }
+
+            await page.WaitForTimeoutAsync(300);
+        }
+
+        return null;
+    }
+
+    private static async Task<ILocator?> FindViewEventPackageButtonAsync(IPage page, int timeoutMs)
+    {
+        var selectors = new[]
+        {
+            "button:has-text('View Event Package')",
+            "a:has-text('View Event Package')",
+            "input[value*='View Event Package' i]",
+            "[id*='VIEW_PKG' i]",
+            "[id*='EVENT_PKG' i]",
+            "[aria-label*='View Event Package' i]"
+        };
+
+        var startedAt = DateTime.UtcNow;
+
+        while ((DateTime.UtcNow - startedAt).TotalMilliseconds < timeoutMs)
+        {
+            foreach (var frame in page.Frames.ToList())
+            {
+                if (frame.IsDetached)
                 {
-                    LogProgress(context, "Attachment download timed out for {0}-{1}. Continuing.", ev.DepartmentCode, ev.EventId);
+                    continue;
                 }
+
+                foreach (var selector in selectors)
+                {
+                    try
+                    {
+                        var candidate = frame.Locator(selector).First;
+                        if (await candidate.CountAsync() > 0 && await candidate.IsVisibleAsync())
+                        {
+                            return candidate;
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore transient frame detachments
+                    }
+                }
+            }
+
+            await page.WaitForTimeoutAsync(500);
+        }
+
+        return null;
+    }
+
+    private static async Task<int> WaitForAttachmentButtonsAsync(IPage page, int timeoutMs)
+    {
+        var startedAt = DateTime.UtcNow;
+
+        while ((DateTime.UtcNow - startedAt).TotalMilliseconds < timeoutMs)
+        {
+            int count = await CountAttachmentRowButtonsAsync(page);
+            if (count > 0)
+            {
+                return count;
+            }
+
+            await page.WaitForTimeoutAsync(500);
+        }
+
+        return 0;
+    }
+
+    private static async Task<int> CountAttachmentRowButtonsAsync(IPage page)
+    {
+        foreach (var frame in page.Frames.ToList())
+        {
+            if (frame.IsDetached)
+            {
+                continue;
+            }
+
+            try
+            {
+                var buttons = frame.Locator("button[id^='PV_ATTACH_WRK_SCM_DOWNLOAD$'], a[id^='PV_ATTACH_WRK_SCM_DOWNLOAD$']");
+                int count = await buttons.CountAsync();
+                if (count > 0)
+                {
+                    return count;
+                }
+            }
+            catch
+            {
+                // Ignore detached frame
             }
         }
 
-        LogProgress(context, "Attachment extraction complete for {0}-{1}. Captured {2} usable files.", ev.DepartmentCode, ev.EventId, results.Count);
-        return results;
+        return 0;
+    }
+
+    private static async Task<ILocator?> FindAttachmentRowButtonAsync(IPage page, int index)
+    {
+        foreach (var frame in page.Frames.ToList())
+        {
+            if (frame.IsDetached)
+            {
+                continue;
+            }
+
+            try
+            {
+                var buttons = frame.Locator("button[id^='PV_ATTACH_WRK_SCM_DOWNLOAD$'], a[id^='PV_ATTACH_WRK_SCM_DOWNLOAD$']");
+                int count = await buttons.CountAsync();
+                if (index < count)
+                {
+                    var target = buttons.Nth(index);
+                    if (await target.IsVisibleAsync())
+                    {
+                        return target;
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore detached frame
+            }
+        }
+
+        return null;
+    }
+
+    private static async Task EnsureAttachmentModalClosedAsync(IPage page)
+    {
+        try
+        {
+            var modal = page.Locator("#attachmentWrapperModal, .modal.in, .modal.show").First;
+            if (await modal.CountAsync() > 0 && await modal.IsVisibleAsync())
+            {
+                var closeBtn = modal.Locator("button[data-dismiss='modal'], button:has-text('Close'), button.close").First;
+                if (await closeBtn.CountAsync() > 0 && await closeBtn.IsVisibleAsync())
+                {
+                    await closeBtn.ClickAsync(new LocatorClickOptions { Timeout = 3000 });
+                }
+                else
+                {
+                    await page.Keyboard.PressAsync("Escape");
+                }
+
+                await modal.WaitForAsync(new LocatorWaitForOptions
+                {
+                    State = WaitForSelectorState.Hidden,
+                    Timeout = 5000
+                });
+            }
+        }
+        catch
+        {
+            // Best-effort modal cleanup
+        }
+    }
+
+    private static async Task CloseExtraPagesAsync(IBrowserContext browserContext, IPage primaryPage)
+    {
+        foreach (var p in browserContext.Pages.ToList())
+        {
+            if (p != primaryPage && !p.IsClosed)
+            {
+                try
+                {
+                    await p.CloseAsync();
+                }
+                catch
+                {
+                    // Ignore already closed pages
+                }
+            }
+        }
     }
 
     private static string ExtractTextFromFile(string filePath)
@@ -409,31 +671,19 @@ public sealed class CalProcureClassifyJob
         string landingDescription,
         List<string> unspscCodes,
         List<(string FileName, string ExtractedText)> attachments,
+        PerformContext? context,
         CancellationToken cancellationToken)
     {
-        // Supports both "Llm:*" and legacy "OpenAI:*" config keys
         var apiKey = _configuration["Llm:ApiKey"] ?? _configuration["OpenAI:ApiKey"];
         var model = _configuration["Llm:Model"] ?? _configuration["OpenAI:Model"] ?? "gpt-4o-mini";
         var configuredEndpoint = _configuration["Llm:Endpoint"];
 
-        if (string.IsNullOrWhiteSpace(apiKey) && !model.StartsWith("ollama/", StringComparison.OrdinalIgnoreCase))
+        if (string.IsNullOrWhiteSpace(apiKey))
         {
-            _logger.LogWarning("LLM API key not configured for event {Dept}-{EventId}; defaulting to IT classification fallback.", ev.DepartmentCode, ev.EventId);
             return new LlmClassificationResult(true, 0.60m, "Llm:ApiKey not configured; flagged as IT based on initial triage.");
         }
 
-        var endpoint = ResolveEndpoint(model, configuredEndpoint);
-        var normalizedModel = model.StartsWith("ollama/", StringComparison.OrdinalIgnoreCase)
-            ? model["ollama/".Length..]
-            : model;
-
-        _logger.LogInformation(
-            "Submitting LLM classification request for event {Dept}-{EventId} using model {Model} at {Endpoint}. Attachments included: {AttachmentCount}",
-            ev.DepartmentCode,
-            ev.EventId,
-            normalizedModel,
-            endpoint,
-            attachments.Count);
+        var endpoint = ResolveLlmEndpoint(model, configuredEndpoint);
 
         var promptBuilder = new StringBuilder();
         promptBuilder.AppendLine($"Event ID: {ev.DepartmentCode}-{ev.EventId}");
@@ -448,38 +698,26 @@ public sealed class CalProcureClassifyJob
             promptBuilder.AppendLine(text.Length > 4000 ? text[..4000] : text);
         }
 
-        var payload = new
-        {
-            model = normalizedModel,
-            messages = new[]
+        bool supportsTemperature = !model.StartsWith("o1", StringComparison.OrdinalIgnoreCase)
+                                && !model.StartsWith("o3", StringComparison.OrdinalIgnoreCase)
+                                && !model.StartsWith("gpt-5", StringComparison.OrdinalIgnoreCase);
+
+        object payload = supportsTemperature
+            ? new
             {
-                new
-                {
-                    role = "system",
-                    content = """
-                        You classify State of California procurement solicitations as IT (Information Technology) or Non-IT.
-                        IT includes software development, SaaS/cloud licenses, cybersecurity, IT staffing/consulting, network/telecom infrastructure, data analytics, ERP/CRM, and computer hardware.
-                        Non-IT includes physical construction, HVAC, vehicles, medical/lab equipment, janitorial, landscaping, general management consulting without IT deliverables, and physical supplies.
-                        Respond strictly with raw JSON (no markdown code blocks) containing keys: "is_it" (boolean), "confidence" (number 0.0-1.0), and "reason" (concise 1-sentence explanation).
-                        """
-                },
-                new
-                {
-                    role = "user",
-                    content = promptBuilder.ToString()
-                }
-            },
-            temperature = 0.1
-        };
+                model,
+                temperature = 0.1,
+                messages = BuildMessages(promptBuilder.ToString())
+            }
+            : new
+            {
+                model,
+                messages = BuildMessages(promptBuilder.ToString())
+            };
 
         var client = _httpClientFactory.CreateClient();
         using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
-
-        if (!string.IsNullOrWhiteSpace(apiKey))
-        {
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-        }
-
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
         request.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
 
         using var response = await client.SendAsync(request, cancellationToken);
@@ -487,42 +725,48 @@ public sealed class CalProcureClassifyJob
 
         if (!response.IsSuccessStatusCode)
         {
-            throw new HttpRequestException($"LLM API ({endpoint}) returned {(int)response.StatusCode}: {responseBody}");
+            LogProgress(context, "LLM API error ({0}) from {1} [model={2}]: {3}", (int)response.StatusCode, endpoint, model, responseBody);
+            throw new HttpRequestException($"LLM API returned {(int)response.StatusCode} ({response.ReasonPhrase}): {responseBody}");
         }
 
         using var doc = JsonDocument.Parse(responseBody);
         var content = doc.RootElement
-            .GetProperty("choices")
+            .GetProperty("choices")[0]
             .GetProperty("message")
             .GetProperty("content")
             .GetString();
 
         if (string.IsNullOrWhiteSpace(content))
         {
-            _logger.LogWarning("LLM returned empty content for event {Dept}-{EventId}.", ev.DepartmentCode, ev.EventId);
             return new LlmClassificationResult(false, 0.50m, "Empty response from LLM.");
         }
 
-        var cleanJson = StripMarkdownCodeFences(content);
-        var parsed = JsonSerializer.Deserialize<LlmClassificationResult>(cleanJson);
-
-        if (parsed is null)
-        {
-            _logger.LogWarning("Unable to parse LLM response JSON for event {Dept}-{EventId}.", ev.DepartmentCode, ev.EventId);
-            return new LlmClassificationResult(false, 0.50m, "Could not parse LLM response.");
-        }
-
-        _logger.LogInformation(
-            "LLM classification complete for event {Dept}-{EventId}. IsIt={IsIt}, Confidence={Confidence}",
-            ev.DepartmentCode,
-            ev.EventId,
-            parsed.IsIt,
-            parsed.Confidence);
-
-        return parsed;
+        var cleanedJson = StripMarkdownCodeFences(content);
+        var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+        var parsed = JsonSerializer.Deserialize<LlmClassificationResult>(cleanedJson, options);
+        return parsed ?? new LlmClassificationResult(false, 0.50m, "Could not parse LLM response.");
     }
 
-    private static string ResolveEndpoint(string model, string? configuredEndpoint)
+    private static object[] BuildMessages(string userPrompt) =>
+    [
+        new
+        {
+            role = "system",
+            content = """
+                You classify State of California procurement solicitations as IT (Information Technology) or Non-IT.
+                IT includes software development, SaaS/cloud licenses, cybersecurity, IT staffing/consulting, network/telecom infrastructure, data analytics, ERP/CRM, and computer hardware.
+                Non-IT includes physical construction, HVAC, vehicles, medical/lab equipment, janitorial, landscaping, general management consulting without IT deliverables, and physical supplies.
+                Respond strictly as raw JSON (no markdown fences) with keys: "is_it" (boolean), "confidence" (number 0.0-1.0), and "reason" (concise 1-sentence explanation).
+                """
+        },
+        new
+        {
+            role = "user",
+            content = userPrompt
+        }
+    ];
+
+    private static string ResolveLlmEndpoint(string model, string? configuredEndpoint)
     {
         if (!string.IsNullOrWhiteSpace(configuredEndpoint))
         {
@@ -534,18 +778,12 @@ public sealed class CalProcureClassifyJob
             return "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
         }
 
-        if (model.StartsWith("ollama/", StringComparison.OrdinalIgnoreCase))
-        {
-            return "http://localhost:11434/v1/chat/completions";
-        }
-
         if (model.StartsWith("llama", StringComparison.OrdinalIgnoreCase) ||
             model.StartsWith("mixtral", StringComparison.OrdinalIgnoreCase))
         {
             return "https://api.groq.com/openai/v1/chat/completions";
         }
 
-        // Default to OpenAI Chat Completions endpoint
         return "https://api.openai.com/v1/chat/completions";
     }
 
@@ -554,8 +792,16 @@ public sealed class CalProcureClassifyJob
         var trimmed = raw.Trim();
         if (trimmed.StartsWith("```", StringComparison.Ordinal))
         {
-            trimmed = Regex.Replace(trimmed, @"^```(?:json)?\s*", string.Empty, RegexOptions.IgnoreCase);
-            trimmed = Regex.Replace(trimmed, @"\s*```$", string.Empty);
+            var firstNewLine = trimmed.IndexOf('\n');
+            if (firstNewLine >= 0)
+            {
+                trimmed = trimmed[(firstNewLine + 1)..];
+            }
+
+            if (trimmed.EndsWith("```", StringComparison.Ordinal))
+            {
+                trimmed = trimmed[..^3];
+            }
         }
 
         return trimmed.Trim();
